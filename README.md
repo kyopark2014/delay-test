@@ -3,6 +3,8 @@
 PC에서 AWS까지 지연을 `tcpping`/`tcping`/Python TCP로 측정합니다.  
 설치 옵션으로 **1) Virginia Region**과 **2) Chicago Local Zone**을 고를 수 있습니다.
 
+[English README](README_en.md)
+
 ## 설치 옵션
 
 | # | `--target` | 위치 | 종류 | 기본 인스턴스 | AZ |
