@@ -118,7 +118,8 @@ flowchart LR
 
 5. **실무 함의**  
    - 서울 클라이언트 → 미국 리소스: Region이든 Chicago LZ든 **왕복 ~200ms**를 각오.  
-   - Chicago LZ의 이득은 **시카고/중서부 사용자 ↔ 해당 LZ** 구간에서 더 크게 나타납니다.
+   - Chicago LZ의 이득은 **시카고/중서부 사용자 ↔ 해당 LZ** 구간에서 더 크게 나타납니다.  
+   - LZ↔Region 백본 지연은 아래 [Local Zone ↔ Region](#local-zone--region-지연-측정) 실측(~22ms)을 참고하세요.
 
 ## 빠른 시작
 
@@ -140,6 +141,96 @@ python delaytest.py --target chicago
 python uninstaller.py --yes                 # 전부
 python uninstaller.py --target chicago -y   # Chicago만
 ```
+
+## Local Zone ↔ Region 지연 측정
+
+서울 PC가 아니라 **Chicago Local Zone EC2 → Virginia Region EC2** (동일 VPC private) 구간을 측정합니다.  
+SG self-peer + SSM으로 LZ에서 Region private IP로 TCP RTT를 집계합니다.
+
+| 파일 | 역할 |
+|---|---|
+| `installer_local_to_region.py` | LZ(송신) + Region(수신) EC2, SG peer, SSM IAM |
+| `delaytest_local_to_region.py` | Chicago에서 SSM probe → Virginia |
+| `uninstaller_local_to_region.py` | EC2 / LZ 서브넷 / SG / SSM IAM / config 삭제 |
+| `config_local_to_region.json` | 전용 config (기존 `config.json`과 분리) |
+
+```bash
+# 환경 구성 (Chicago LZ + Virginia Region)
+python installer_local_to_region.py
+
+# 측정 (기본: VPC private IP)
+python delaytest_local_to_region.py
+python delaytest_local_to_region.py --count 30 --ports 22,80
+
+# public IP 경로로 비교하고 싶을 때
+python delaytest_local_to_region.py --via public
+
+# 삭제
+python uninstaller_local_to_region.py --yes
+# 호환: python installer_local_to_region.py --destroy --yes
+```
+
+```mermaid
+flowchart LR
+  subgraph LZ["Chicago Local Zone"]
+    SRC["EC2 source<br/>us-east-1-chi-2a"]
+  end
+  subgraph REG["Virginia Region"]
+    DST["EC2 dest<br/>us-east-1a"]
+  end
+  SRC -->|"VPC private TCP SYN<br/>RTT ~22 ms"| DST
+  PC["delaytest_local_to_region.py"] -.->|"SSM SendCommand"| SRC
+```
+
+### 측정 결과 (Chicago LZ → Virginia Region)
+
+| 항목 | 값 |
+|---|---|
+| 구간 | **Chicago Local Zone → Virginia Region** (VPC private) |
+| 도구 | Python TCP via SSM (`python-tcp-ssm`) |
+| source | `us-east-1-chi-2a` · private `172.31.106.166` |
+| dest | `us-east-1a` · private `172.31.81.26` |
+| 간격 | 1초 · loss 0% (두 런 모두) |
+
+#### 단기(30회, ~1분) vs 장기(150회, ~5분)
+
+| 런 | 시각 (UTC) | Port | n | Min | Avg | Max | Stdev | P50 | P95 | ~1-way |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 단기 | 2026-11-26 07:46 | 22 | 30 | 19.8 | **21.8** | 23.7 | 0.8 | 22.0 | 22.3 | ~10.9 |
+| 단기 | 2026-11-26 07:46 | 80 | 30 | 19.7 | **21.6** | 22.3 | 0.9 | 22.0 | 22.2 | ~10.8 |
+| **장기** | **2026-11-26 07:56** | **22** | **150** | **19.7** | **21.5** | **23.5** | **1.0** | **22.0** | **22.2** | **~10.7** |
+| **장기** | **2026-11-26 07:56** | **80** | **150** | **19.6** | **21.5** | **22.7** | **0.9** | **22.0** | **22.2** | **~10.8** |
+
+**단기→장기 avg 차이 (TCP 22):** 21.8 → 21.5 (**−0.3 ms**). 5분 연속 측정에서도 분포가 거의 동일합니다.
+
+원본: [`results/latest-local-to-region.json`](results/latest-local-to-region.json) (장기 150회), [`results/l2r-20261126T074637Z.json`](results/l2r-20261126T074637Z.json) (단기 30회)
+
+### 구간별 한눈에 비교
+
+| 구간 | 경로 | TCP 22 Avg | ~1-way | 비고 |
+|---|---|---:|---:|---|
+| 서울 → Virginia Region | Internet | **203.4** | ~101.7 | 대륙 횡단 지배 |
+| 서울 → Chicago LZ | Internet | **190.1** | ~95.0 | 서울 기준 LZ가 ~13ms 유리 |
+| **Chicago LZ → Virginia** | **VPC private** | **21.5** | **~10.7** | 5분(n=150) 기준 |
+
+### 분석
+
+1. **LZ ↔ Region은 ~21–22ms RTT (한쪽 ~11ms)**  
+   VPC private에서 TCP 22/80 avg **~21.5ms**, stdev **~1ms**, loss 0%. 서울→AWS(~190–200ms)와 스케일이 완전히 다릅니다.
+
+2. **5분 장기 측정이 단기와 일치**  
+   30회(~1분)와 150회(~5분)의 avg/P50/P95가 거의 같고(avg 차이 ≤0.3ms), 스파이크·드리프트가 없습니다. 단발 샘플이 우연이 아님을 확인합니다.
+
+3. **대륙 횡단이 전체 지연의 대부분**  
+   서울→Virginia(~203ms)에서 LZ→Region(~22ms)을 빼면, 대략 **~180ms+가 서울↔북미 인터넷/백본**에 해당합니다. Local Zone을 써도 이 구간은 줄지 않습니다.
+
+4. **지터가 매우 안정적**  
+   장기 런에서도 stdev ~1ms, P50≈P95≈22ms. 인터넷 경유(서울→Virginia stdev 19ms)와 대비됩니다.
+
+5. **실무 함의**  
+   - 시카고 현지 앱 ↔ Virginia Region API/DB: **왕복 ~22ms**를 설계 예산에 넣을 수 있음.  
+   - 서울(또는 원격) 클라이언트 체감 지연은 여전히 **~200ms대**가 지배적.  
+   - LZ는 “현지 사용자 ↔ LZ 워크로드”와 “LZ ↔ parent Region” 분리 설계에 의미가 큼.
 
 ## 도구 설치
 
@@ -205,7 +296,9 @@ python uninstaller.py --target chicago -y
 
 ## 산출물
 
-- `config.json` — 타겟별 인스턴스/IP/SG
+- `config.json` — 서울→AWS 타겟별 인스턴스/IP/SG
+- `config_local_to_region.json` — LZ→Region 전용
 - `results/latest.json` / `comparison-latest.json`
 - `results/latest-virginia.json` / `latest-chicago.json`
+- `results/latest-local-to-region.json` / `l2r-*.json`
 - `docs/architecture.svg`

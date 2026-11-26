@@ -118,7 +118,8 @@ Source: [`results/comparison-latest.json`](results/comparison-latest.json)
 
 5. **Practical takeaways**  
    - Seoul client → U.S. resources: expect **~200 ms RTT** whether Region or Chicago LZ.  
-   - Chicago LZ gains show up more clearly for **Chicago / Midwest users ↔ that Local Zone**.
+   - Chicago LZ gains show up more clearly for **Chicago / Midwest users ↔ that Local Zone**.  
+   - For LZ↔Region backbone latency, see [Local Zone ↔ Region](#local-zone--region-latency) (~22 ms measured).
 
 ## Quick start
 
@@ -140,6 +141,83 @@ python delaytest.py --target chicago
 python uninstaller.py --yes                 # all
 python uninstaller.py --target chicago -y   # Chicago only
 ```
+
+## Local Zone ↔ Region latency
+
+Measure **Chicago Local Zone EC2 → Virginia Region EC2** on the same VPC private path (not Seoul PC → AWS). SG self-peer + SSM runs the TCP probe from the LZ instance.
+
+```bash
+python installer_local_to_region.py
+python delaytest_local_to_region.py
+python delaytest_local_to_region.py --via public   # optional public path
+python uninstaller_local_to_region.py --yes
+# compat: python installer_local_to_region.py --destroy --yes
+```
+
+```mermaid
+flowchart LR
+  subgraph LZ["Chicago Local Zone"]
+    SRC["EC2 source<br/>us-east-1-chi-2a"]
+  end
+  subgraph REG["Virginia Region"]
+    DST["EC2 dest<br/>us-east-1a"]
+  end
+  SRC -->|"VPC private TCP SYN<br/>RTT ~22 ms"| DST
+  PC["delaytest_local_to_region.py"] -.->|"SSM SendCommand"| SRC
+```
+
+### Results (Chicago LZ → Virginia Region)
+
+| Field | Value |
+|---|---|
+| Path | **Chicago Local Zone → Virginia Region** (VPC private) |
+| Tool | Python TCP via SSM (`python-tcp-ssm`) |
+| source | `us-east-1-chi-2a` · private `172.31.106.166` |
+| dest | `us-east-1a` · private `172.31.81.26` |
+| Interval | 1s · 0% loss (both runs) |
+
+#### Short (30 probes, ~1 min) vs long (150 probes, ~5 min)
+
+| Run | Time (UTC) | Port | n | Min | Avg | Max | Stdev | P50 | P95 | ~1-way |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Short | 2026-11-26 07:46 | 22 | 30 | 19.8 | **21.8** | 23.7 | 0.8 | 22.0 | 22.3 | ~10.9 |
+| Short | 2026-11-26 07:46 | 80 | 30 | 19.7 | **21.6** | 22.3 | 0.9 | 22.0 | 22.2 | ~10.8 |
+| **Long** | **2026-11-26 07:56** | **22** | **150** | **19.7** | **21.5** | **23.5** | **1.0** | **22.0** | **22.2** | **~10.7** |
+| **Long** | **2026-11-26 07:56** | **80** | **150** | **19.6** | **21.5** | **22.7** | **0.9** | **22.0** | **22.2** | **~10.8** |
+
+**Short→long avg delta (TCP 22):** 21.8 → 21.5 (**−0.3 ms**). Distribution stays the same over a 5-minute window.
+
+Source: [`results/latest-local-to-region.json`](results/latest-local-to-region.json) (long n=150), [`results/l2r-20261126T074637Z.json`](results/l2r-20261126T074637Z.json) (short n=30)
+
+### Cross-path comparison
+
+| Path | Route | TCP 22 Avg | ~1-way | Notes |
+|---|---|---:|---:|---|
+| Seoul → Virginia Region | Internet | **203.4** | ~101.7 | Transcontinental dominated |
+| Seoul → Chicago LZ | Internet | **190.1** | ~95.0 | ~13 ms better from Seoul |
+| **Chicago LZ → Virginia** | **VPC private** | **21.5** | **~10.7** | 5 min (n=150) |
+
+### Analysis
+
+1. **LZ ↔ Region ≈ 21–22 ms RTT (~11 ms one-way)**  
+   On VPC private, TCP 22/80 avg **~21.5 ms**, stdev **~1 ms**, 0% loss—orders of magnitude below Seoul→AWS (~190–200 ms).
+
+2. **5-minute run matches the short sample**  
+   30 probes (~1 min) and 150 probes (~5 min) have nearly identical avg/P50/P95 (avg delta ≤0.3 ms); no spike or drift. The short sample was not a fluke.
+
+3. **Most Seoul→AWS latency is the long haul**  
+   Seoul→Virginia (~203 ms) minus LZ→Region (~22 ms) leaves roughly **~180 ms+** on Seoul↔North America internet/backbone. Local Zone does not remove that.
+
+4. **Very stable jitter**  
+   Even in the long run, stdev ~1 ms; P50≈P95≈22 ms—unlike Seoul→Virginia (stdev 19 ms).
+
+5. **Practical takeaways**  
+   - Chicago-local app ↔ Virginia Region API/DB: budget **~22 ms RTT**.  
+   - Remote (e.g. Seoul) client latency remains **~200 ms**-class.  
+   - LZ shines when you separate “local users ↔ LZ workload” from “LZ ↔ parent Region”.
+
+Config: `config_local_to_region.json` (separate from `config.json`)  
+Outputs: `results/latest-local-to-region.json`, `results/l2r-*.json`
 
 ## Tooling
 
@@ -205,7 +283,9 @@ Deletes: EC2 · LZ subnet · security group (if no other target remains) · `con
 
 ## Artifacts
 
-- `config.json` — per-target instance / IP / SG
+- `config.json` — Seoul→AWS per-target instance / IP / SG
+- `config_local_to_region.json` — LZ→Region dedicated config
 - `results/latest.json` / `comparison-latest.json`
 - `results/latest-virginia.json` / `latest-chicago.json`
+- `results/latest-local-to-region.json` / `l2r-*.json`
 - `docs/architecture.svg`
